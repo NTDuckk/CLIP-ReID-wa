@@ -232,18 +232,16 @@ class build_transformer(nn.Module):
                     text_tokens = self.simple_text_tokens.to(patch_tokens.device)  # (1, L, 512)
                     text_tokens = text_tokens.expand(patch_tokens.size(0), -1, -1)  # (B, L, 512)
 
-                # Cross-Attention: Q = patch_tokens, K/V = text_tokens
-                attended_patches, attn_weights = self.cross_attention(
+                # Cross-Attention: Q = patch_tokens, K/V = text_tokens, với cls_token
+                refined_tokens, attn_weights = self.cross_attention(
                     query=patch_tokens,
                     key=text_tokens,
-                    value=text_tokens
-                )  # (B, num_patches, 512)
+                    value=text_tokens,
+                    cls_token=cls_token
+                )  # refined_tokens (B, num_patches+1, 512)
 
-                # Gộp thông tin từ các patch (ví dụ: avg pooling)
-                attended_feature = attended_patches.mean(dim=1)  # (B, 512)
-
-                # Residual connection với CLS token
-                feat_post_ca = cls_token + self.ca_alpha * attended_feature
+                # Lấy CLS token sau refine làm feature cuối
+                feat_post_ca = refined_tokens[:, 0]  # (B, 512)
             else:
                 feat_post_ca = feat_pre_ca
 

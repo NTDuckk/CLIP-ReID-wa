@@ -58,12 +58,13 @@ class CrossAttentionModule(nn.Module):
             for _ in range(num_self_blocks)
         ])
 
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, cls_token=None):
         # query: (B, num_patches, D)  - patch tokens
         # key:   (B, num_text_tokens, D) - text tokens
         # value: (B, num_text_tokens, D) - text tokens
+        # cls_token: (B, D) - CLS token
 
-        # Cross attention: query (text) attends to key (image patches)
+        # Cross attention: query (patches) attends to key/value (text)
         attn_output, attn_weights = self.cross_attention(
             query=query,
             key=key,
@@ -73,8 +74,18 @@ class CrossAttentionModule(nn.Module):
         # Residual connection and layer norm cho cross-attention
         x = self.cross_norm(query + self.cross_dropout(attn_output))
 
-        # Apply multiple self-attention blocks (giống PromptSG)
-        for self_block in self.self_blocks:
-            x = self_block(x)
+        # Reweight patches using attn_weights
+        weights = attn_weights.mean(dim=[1, 3])  # (B, num_patches)
+        reweighted_patches = weights.unsqueeze(-1) * query  # (B, num_patches, D)
 
-        return x, attn_weights
+        # Concat CLS with reweighted patches
+        if cls_token is not None:
+            concat_tokens = torch.cat([cls_token.unsqueeze(1), reweighted_patches], dim=1)  # (B, num_patches+1, D)
+        else:
+            concat_tokens = reweighted_patches
+
+        # Apply multiple self-attention blocks
+        for self_block in self.self_blocks:
+            concat_tokens = self_block(concat_tokens)
+
+        return concat_tokens, attn_weights

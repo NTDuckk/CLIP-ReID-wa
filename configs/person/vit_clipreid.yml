@@ -77,7 +77,7 @@ TEST:
   FEAT_NORM: 'yes'
 DATASETS:
   NAMES: ('market1501')
-  ROOT_DIR: ('/kaggle/working/CLIP-ReID/datasets/dataset')
+  ROOT_DIR: ('/kaggle/working/CLIP-ReID-wa/datasets/dataset')
 OUTPUT_DIR: ('logs/market1501_vit/')
 
 #   NAMES: ('dukemtmc')
