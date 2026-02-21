@@ -69,6 +69,53 @@ class TextEncoder(nn.Module):
 #--------------------------------------------------------------------------------------------------
 #
 #
+# ===================== THÊM CÁC CLASS MỚI =====================
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, tgt, memory):
+        # tgt: (B, L_t, D), memory: (B, L_v, D)
+        # Self-attention
+        tgt2 = self.self_attn(tgt, tgt, tgt)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        # Cross-attention (tgt query, memory key/value)
+        tgt2 = self.cross_attn(tgt, memory, memory)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        # FFN
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        tgt = tgt + tgt2
+        tgt = self.norm3(tgt)
+        return tgt
+
+class TextGuidedDecoder(nn.Module):
+    def __init__(self, num_layers, d_model, nhead, dim_feedforward, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, text_tokens, visual_tokens):
+        out = text_tokens
+        for layer in self.layers:
+            out = layer(out, visual_tokens)
+        return self.norm(out)
+
 class build_transformer(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg):
         super(build_transformer, self).__init__()
@@ -151,14 +198,14 @@ class build_transformer(nn.Module):
 
         # ---------- cross-attention module ----------
         if self.use_cross_attention:
-            self.cross_attention = CrossAttentionModule(
-                d_model=512,
-                nhead=8,
-                num_self_blocks=2,
+            self.text_guided_decoder = TextGuidedDecoder(
+                num_layers=cfg.MODEL.CROSS_ATTENTION_LAYERS,  # nên = 3
+                d_model=cfg.MODEL.CROSS_ATTENTION_DIM,        # 512
+                nhead=cfg.MODEL.CROSS_ATTENTION_HEADS,        # 8
+                dim_feedforward=cfg.MODEL.CROSS_ATTENTION_FFN_DIM,  # 2048
                 dropout=0.1
             )
-            # residual weight cho nhánh CA
-            self.ca_alpha = nn.Parameter(torch.tensor(0.1))
+            self.ca_alpha = nn.Parameter(torch.tensor(0.1))   # λ trong paper
             
     def forward(self, x=None, label=None, get_image=False, get_text=False,  
         cam_label=None, view_label=None, use_cross_attention=False, return_all=False):
@@ -215,33 +262,31 @@ class build_transformer(nn.Module):
 
             # Lấy patch tokens (bỏ CLS token)
             patch_tokens = image_features_proj[:, 1:, :]  # (B, num_patches, 512)
-            cls_token = image_features_proj[:, 0, :]      # (B, 512)  # vẫn giữ cho các phần khác
+            cls_token = image_features_proj[:, 0, :]      # (B, 512)
 
-            # Trước CA
-            feat_pre_ca = cls_token  # vẫn dùng CLS cho các loss khác
+            # Text tokens
+            if self.training and (label is not None):
+                prompts = self.prompt_learner(label)
+                # Lấy tất cả text tokens (N, L, 512)
+                text_tokens = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts, return_all_tokens=True)
+            else:
+                # Eval/Inference: dùng prompt cố định (đã lưu sẵn)
+                text_tokens = self.simple_text_tokens.to(patch_tokens.device)  # (1, L, 512)
+                text_tokens = text_tokens.expand(patch_tokens.size(0), -1, -1)  # (B, L, 512)
 
-            # Cross-Attention
+            # Feature trước CA (dùng cho I2T loss)
+            feat_pre_ca = cls_token
+
+            # Cross-Attention: text query, visual key/value
             if self.use_cross_attention and use_cross_attention:
-                if self.training and (label is not None):
-                    # Training: dùng prompt theo ID
-                    prompts = self.prompt_learner(label)
-                    # Lấy tất cả text tokens (N, L, 512)
-                    text_tokens = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts, return_all_tokens=True)
-                else:
-                    # Eval/Inference: dùng prompt cố định (đã lưu sẵn)
-                    text_tokens = self.simple_text_tokens.to(patch_tokens.device)  # (1, L, 512)
-                    text_tokens = text_tokens.expand(patch_tokens.size(0), -1, -1)  # (B, L, 512)
-
-                # Cross-Attention: Q = patch_tokens, K/V = text_tokens, với cls_token
-                refined_tokens, attn_weights = self.cross_attention(
-                    query=patch_tokens,
-                    key=text_tokens,
-                    value=text_tokens,
-                    cls_token=cls_token
-                )  # refined_tokens (B, num_patches+1, 512)
-
-                # Lấy CLS token sau refine làm feature cuối
-                feat_post_ca = refined_tokens[:, 0]  # (B, 512)
+                refined_text_tokens = self.text_guided_decoder(text_tokens, patch_tokens)  # (B, L, 512)
+                # Lấy EOS token (vị trí cuối cùng) - vì CLIP thêm EOS ở cuối
+                refined_eos = refined_text_tokens[:, -1, :]   # (B, 512)
+                # Text feature gốc (EOS)
+                orig_eos = text_tokens[:, -1, :]               # (B, 512)
+                # Residual connection (công thức 12)
+                joint_feat = orig_eos + self.ca_alpha * refined_eos
+                feat_post_ca = joint_feat
             else:
                 feat_post_ca = feat_pre_ca
 

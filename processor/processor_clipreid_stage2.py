@@ -121,7 +121,7 @@ def do_train_stage2(cfg,
                 logits = feat_pre @ text_features.t()
 
                 # Loss tổng: ID + Triplet + I2T (định nghĩa trong make_loss.py)
-                loss = loss_fn(score, feat_align, target, target_cam, logits)
+                loss, id_loss, tri_loss, i2t_loss = loss_fn(score, feat_align, target, target_cam, logits)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -142,9 +142,9 @@ def do_train_stage2(cfg,
             torch.cuda.synchronize()
             if (n_iter + 1) % log_period == 0:
                 logger.info(
-                    "Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}"
+                    "Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (ID: {:.3f}, Tri: {:.3f}, I2T: {:.3f}), Acc: {:.3f}, Base Lr: {:.2e}"
                     .format(epoch, (n_iter + 1), len(train_loader_stage2),
-                            loss_meter.avg, acc_meter.avg, scheduler.get_lr()[0])
+                            loss_meter.avg, id_loss.item(), tri_loss.item(), i2t_loss.item(), acc_meter.avg, scheduler.get_lr()[0])
                 )
 
         end_time = time.time()

@@ -55,7 +55,9 @@ def make_loss(cfg, num_classes):    # modified by gu
                         I2TLOSS = xent(i2tscore, target)
                         loss = cfg.MODEL.I2T_LOSS_WEIGHT * I2TLOSS + loss
                         
-                    return loss
+                    else:
+                        I2TLOSS = 0.0
+                    return loss, ID_LOSS, TRI_LOSS, I2TLOSS
                 else:
                     if isinstance(score, list):
                         ID_LOSS = [F.cross_entropy(scor, target) for scor in score[0:]]
@@ -75,8 +77,10 @@ def make_loss(cfg, num_classes):    # modified by gu
                         I2TLOSS = F.cross_entropy(i2tscore, target)
                         loss = cfg.MODEL.I2T_LOSS_WEIGHT * I2TLOSS + loss
 
+                    else:
+                        I2TLOSS = 0.0
 
-                    return loss
+                    return loss, ID_LOSS, TRI_LOSS, I2TLOSS
             else:
                 print('expected METRIC_LOSS_TYPE should be triplet'
                       'but got {}'.format(cfg.MODEL.METRIC_LOSS_TYPE))
