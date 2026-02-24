@@ -188,6 +188,10 @@ class build_transformer(nn.Module):
             num_classes, dataset_name, clip_model.dtype, clip_model.token_embedding
         )
         self.text_encoder = TextEncoder(clip_model)
+        # CLIP logit scale (frozen) used for similarity in Stage1/Stage2
+        self.logit_scale = clip_model.logit_scale
+        self.logit_scale.requires_grad_(False)
+        self.embed_dim = int(clip_model.text_projection.shape[1])
 
         # ---------- simplified prompt ----------
         # Thay vì chỉ lưu embedding, encode luôn text tokens
@@ -209,7 +213,13 @@ class build_transformer(nn.Module):
                 dim_feedforward=cfg.MODEL.CROSS_ATTENTION_FFN_DIM,  # 2048
                 dropout=0.1
             )
-            self.ca_alpha = nn.Parameter(torch.tensor(0.1))   # λ trong paper
+            # paper uses a very small residual factor λ = 1e-4 (fixed)
+            self.register_buffer('ca_alpha', torch.tensor(1e-4, dtype=torch.float32))
+            # For RN50: project text/image to compact dim for TransformerDecoder
+            self.tgi_q_proj = nn.Linear(self.embed_dim, cfg.MODEL.CROSS_ATTENTION_DIM, bias=False)
+            self.tgi_out_proj = nn.Linear(cfg.MODEL.CROSS_ATTENTION_DIM, self.embed_dim, bias=False)
+            # Stage-3 visual feature map channels for RN50 is 1024 (layer3 output)
+            self.tgi_kv_proj = nn.Conv2d(1024, cfg.MODEL.CROSS_ATTENTION_DIM, kernel_size=1, stride=1, padding=0, bias=False)
             
     def forward(self, x=None, label=None, get_image=False, get_text=False,  
         cam_label=None, view_label=None, use_cross_attention=False, return_all=False):
@@ -229,22 +239,45 @@ class build_transformer(nn.Module):
                 return image_features_proj[:, 0]
 
         # ====== MAIN FORWARD ======
+        updated_text = None  # used to override positive-class I2T logit in Stage2
         if self.model_name == 'RN50':
-            # ---------- RN50 branch: không dùng CA ----------
+            # ---------- RN50 branch: MSCSA (in visual) + Text-Guided Image (TGI) ----------
             image_features_last, image_features, image_features_proj = self.image_encoder(x)
+            # image_features_last: stage3 (B,1024,H,W)  | image_features: stage4 (B,2048,H,W)
+            # image_features_proj: attnpool seq (HW+1,B,embed_dim)
 
             img_feature_last = nn.functional.avg_pool2d(
                 image_features_last, image_features_last.shape[2:4]
-            ).view(x.shape[0], -1)
+            ).view(x.shape[0], -1)   # (B,1024)
+
             img_feature = nn.functional.avg_pool2d(
                 image_features, image_features.shape[2:4]
-            ).view(x.shape[0], -1)
+            ).view(x.shape[0], -1)   # (B,2048)
 
-            img_feature_proj = image_features_proj[0]   # (B, 512)
+            img_feature_proj = image_features_proj[0]   # (B, embed_dim)  (pooled token from attnpool)
 
-            # pre/post-CA giống nhau (không có CA cho RN50)
+            # feature before / after CA: for RN50 we keep image embedding (paper uses updated text for logits)
             feat_pre_ca = img_feature_proj
             feat_post_ca = img_feature_proj
+
+            # TGI (paper Sec.3.4): update text feature via TransformerDecoder with visual stage3 as memory
+            if self.use_cross_attention and use_cross_attention and self.training and (label is not None):
+                prompts = self.prompt_learner(label)
+                t_base = self.text_encoder(
+                    prompts, self.prompt_learner.tokenized_prompts, return_all_tokens=False
+                )  # (B, embed_dim)
+
+                # project visual stage3 to compact dim and flatten to tokens
+                kv = self.tgi_kv_proj(image_features_last)  # (B, d_model, H, W)
+                Bv, Cv, Hv, Wv = kv.shape
+                kv_tokens = kv.flatten(2).transpose(1, 2).contiguous()  # (B, HW, d_model)
+
+                # query is compact text embedding
+                q = self.tgi_q_proj(t_base).unsqueeze(1)  # (B, 1, d_model)
+                delta = self.text_guided_decoder(q, kv_tokens).squeeze(1)  # (B, d_model)
+
+                delta_embed = self.tgi_out_proj(delta)  # (B, embed_dim)
+                updated_text = t_base + self.ca_alpha * delta_embed
 
         elif self.model_name == 'ViT-B-16':
             # ---------- SIE embedding ----------
@@ -320,7 +353,7 @@ class build_transformer(nn.Module):
             #   - cls_score_proj: cho L_id (sau CA)
             #   - feat_post_ca:   feature sau CA cho L_tri
             #   - feat_pre_ca:    feature trước CA cho Li2t_ce / SupCon
-            return [cls_score, cls_score_proj],[img_feature_last, img_feature, feat_post_ca], feat_pre_ca
+            return [cls_score, cls_score_proj],[img_feature_last, img_feature, feat_post_ca], feat_pre_ca, updated_text
         else:
             # ===== TEST / EVAL =====
             if self.neck_feat == 'after':

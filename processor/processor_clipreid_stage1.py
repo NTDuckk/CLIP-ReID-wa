@@ -7,7 +7,6 @@ from torch.cuda import amp
 import torch.distributed as dist
 import collections
 from torch.nn import functional as F
-from loss.supcontrast import SupConLoss
 
 def do_train_stage1(cfg,
              model,
@@ -31,7 +30,8 @@ def do_train_stage1(cfg,
 
     loss_meter = AverageMeter()
     scaler = amp.GradScaler()
-    xent = SupConLoss(device)
+    # Stage1 loss (paper Eq.1-3): Li2t + Lt2i
+    eps = 1e-12
     
     # train
     import time
@@ -73,9 +73,31 @@ def do_train_stage1(cfg,
             target = labels_list[b_list]
             image_features = image_features_list[b_list]
             with amp.autocast(enabled=True):
-                text_features = model(label = target, get_text = True)
-            loss_i2t = xent(image_features, text_features, target, target)
-            loss_t2i = xent(text_features, image_features, target, target)
+                text_features = model(label=target, get_text=True)
+
+            # Normalize features (cosine similarity) and use CLIP's logit_scale
+            if isinstance(model, nn.DataParallel):
+                logit_scale = model.module.logit_scale.exp().float()
+            else:
+                logit_scale = model.logit_scale.exp().float()
+
+            v = F.normalize(image_features.float(), dim=-1)
+            t = F.normalize(text_features.float(), dim=-1)
+
+            # Similarity matrix s(V_i, T_j)
+            sim = logit_scale * (v @ t.t())  # (B,B)
+
+            # Eq.(1) Li2t: standard CE with diagonal positives
+            targets_i2t = torch.arange(sim.size(0), device=sim.device)
+            loss_i2t = F.cross_entropy(sim, targets_i2t)
+
+            # Eq.(2) Lt2i: sum of positives mass for each text column
+            exp_sim = torch.exp(sim)
+            labels = target
+            pos_mask = (labels.view(1, -1) == labels.view(-1, 1)).float()  # (B,B)  (row=image, col=text)
+            numer = (exp_sim * pos_mask).sum(dim=0)  # (B,)
+            denom = exp_sim.sum(dim=0)               # (B,)
+            loss_t2i = (-torch.log((numer + eps) / (denom + eps))).mean()
 
             loss = loss_i2t + loss_t2i
 
@@ -84,7 +106,7 @@ def do_train_stage1(cfg,
             scaler.step(optimizer)
             scaler.update()
 
-            loss_meter.update(loss.item(), img.shape[0])
+            loss_meter.update(loss.item(), target.size(0))
 
             torch.cuda.synchronize()
             if (i + 1) % log_period == 0:

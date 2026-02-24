@@ -107,7 +107,7 @@ def do_train_stage2(cfg,
                 #  - score: logits ID (feat sau CA)
                 #  - feat_align: feature cho Triplet (sau CA)
                 #  - feat_pre: feature trước CA cho Li2t (I2T CE)
-                score, feat_align, feat_pre = model(
+                score, feat_align, feat_pre, updated_text = model(
                     x=img,
                     label=target,
                     cam_label=target_cam,
@@ -117,11 +117,28 @@ def do_train_stage2(cfg,
 
                 # Đồng bộ dtype với text_features (float32)
                 feat_pre = feat_pre.to(text_features.dtype)
-                # I2T logits dùng feature TRƯỚC CA
-                logits = feat_pre @ text_features.t()
+
+                # Normalize + CLIP logit_scale
+                if isinstance(model, nn.DataParallel):
+                    logit_scale = model.module.logit_scale.exp().float()
+                else:
+                    logit_scale = model.logit_scale.exp().float()
+
+                v = F.normalize(feat_pre.float(), dim=-1)
+                t_all = F.normalize(text_features.float(), dim=-1)
+
+                logits = logit_scale * (v @ t_all.t())
+
+                # Replace positive-class logit by updated text (paper Sec.3.4)
+                if updated_text is not None:
+                    t_upd = F.normalize(updated_text.float(), dim=-1)
+                    pos_new = logit_scale * (v * t_upd).sum(dim=-1)  # (B,)
+                    idx = torch.arange(target.size(0), device=target.device)
+                    logits = logits.clone()
+                    logits[idx, target] = pos_new
 
                 # Loss tổng: ID + Triplet + I2T (định nghĩa trong make_loss.py)
-                loss, id_loss, tri_loss, i2t_loss = loss_fn(score, feat_align, target, target_cam, logits)
+                loss = loss_fn(score, feat_align, target, target_cam, logits)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -142,9 +159,9 @@ def do_train_stage2(cfg,
             torch.cuda.synchronize()
             if (n_iter + 1) % log_period == 0:
                 logger.info(
-                    "Epoch[{}] Iteration[{}/{}] Loss: {:.3f} (ID: {:.3f}, Tri: {:.3f}, I2T: {:.3f}), Acc: {:.3f}, Base Lr: {:.2e}"
+                    "Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}"
                     .format(epoch, (n_iter + 1), len(train_loader_stage2),
-                            loss_meter.avg, id_loss.item(), tri_loss.item(), i2t_loss.item(), acc_meter.avg, scheduler.get_lr()[0])
+                            loss_meter.avg, acc_meter.avg, scheduler.get_lr()[0])
                 )
 
         end_time = time.time()
@@ -192,7 +209,7 @@ def do_train_stage2(cfg,
                                 img,
                                 cam_label=camids,
                                 view_label=target_view,
-                                use_cross_attention=True
+                                use_cross_attention=False
                             )
                             evaluator.update((feat, vid, camid))
 
@@ -222,7 +239,7 @@ def do_train_stage2(cfg,
                             img,
                             cam_label=camids,
                             view_label=target_view,
-                            use_cross_attention=True
+                            use_cross_attention=False
                         )
                         evaluator.update((feat, vid, camid))
 
@@ -250,7 +267,7 @@ def do_train_stage2(cfg,
             else:
                 target_view = None
 
-            feat = model(img, cam_label=camids, view_label=target_view, use_cross_attention=True)
+            feat = model(img, cam_label=camids, view_label=target_view, use_cross_attention=False)
             evaluator.update((feat, vid, camid))
 
     cmc, mAP, _, _, _, _, _ = evaluator.compute()
@@ -299,7 +316,7 @@ def do_inference(cfg,
             else:
                 target_view = None
             # Inference sử dụng visual feature thuần, không dùng cross-attention
-            feat = model(img, cam_label=camids, view_label=target_view,use_cross_attention=True)
+            feat = model(img, cam_label=camids, view_label=target_view,use_cross_attention=False)
             evaluator.update((feat, pid, camid))
             img_path_list.extend(imgpath)
 

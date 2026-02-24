@@ -89,6 +89,65 @@ class AttentionPool2d(nn.Module):
 
         return x 
 
+
+class MSCSA(nn.Module):
+    """Multi-level Channel-Spatial feature aggregation module (MSCSA).
+
+    This module fuses a low-level feature map f_l and a high-level feature map f_h.
+    It follows the paper's Eq.(8)-(10): channel aggregation then spatial aggregation,
+    with residual connections.
+    """
+    def __init__(self, c_low: int, c_high: int, stride: int = 1, reduction: int = 4):
+        super().__init__()
+        # "compact embeddings": reduce channels for attention computation
+        c_red = max(1, c_high // reduction)
+
+        # Channel aggregation (Eq.8-9)
+        self.psi1q = nn.Conv2d(c_high, c_red, kernel_size=1, stride=1, padding=0, bias=False)
+        self.psi1k = nn.Conv2d(c_low,  c_red, kernel_size=1, stride=stride, padding=0, bias=False)
+        self.psi1v = nn.Conv2d(c_low,  c_red, kernel_size=1, stride=stride, padding=0, bias=False)
+        self.omega_c = nn.Conv2d(c_red, c_high, kernel_size=1, stride=1, padding=0, bias=False)
+
+        # Spatial aggregation (Eq.10) - analogous to channel aggregation
+        self.psi_s  = nn.Conv2d(c_high, c_red, kernel_size=1, stride=1, padding=0, bias=False)
+        self.psi2v  = nn.Conv2d(c_low,  c_red, kernel_size=1, stride=stride, padding=0, bias=False)
+        self.omega_s = nn.Conv2d(c_red, c_high, kernel_size=1, stride=1, padding=0, bias=False)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, f_l: torch.Tensor, f_h: torch.Tensor) -> torch.Tensor:
+        # f_l: (B, C_l, H_l, W_l), f_h: (B, C_h, H_h, W_h)
+        B, _, Hh, Wh = f_h.shape
+        HW = Hh * Wh
+
+        # ============ Channel aggregation ============
+        q = self.psi1q(f_h).view(B, -1, HW)             # (B, C_red, HW)
+        k = self.psi1k(f_l).view(B, -1, HW)             # (B, C_red, HW)
+        v = self.psi1v(f_l).view(B, -1, HW)             # (B, C_red, HW)
+
+        # Eq.(8): M_c = softmax( q * k^T )  -> (B, C_red, C_red)
+        M_c = torch.bmm(q, k.transpose(1, 2))
+        M_c = self.softmax(M_c)
+
+        # Eq.(9): f_h^c = omega_c( v * M_c ) + f_h
+        out_c = torch.bmm(M_c, v).view(B, -1, Hh, Wh)   # (B, C_red, H, W)
+        f_h_c = self.omega_c(out_c) + f_h               # residual
+
+        # ============ Spatial aggregation ============
+        q_s = self.psi_s(f_h_c).view(B, -1, HW).transpose(1, 2)  # (B, HW, C_red)
+        v_s = self.psi2v(f_l).view(B, -1, HW)                    # (B, C_red, HW)
+
+        # M_s captures spatial similarity -> (B, HW, HW)
+        M_s = torch.bmm(q_s, v_s)                                # (B, HW, HW)
+        M_s = self.softmax(M_s)
+
+        # Eq.(10): f_h^s = omega_s( psi2v(f_l) * M_s ) + f_h^c
+        out_s = torch.bmm(v_s, M_s).view(B, -1, Hh, Wh)          # (B, C_red, H, W)
+        f_h_s = self.omega_s(out_s) + f_h_c                      # residual
+
+        return f_h_s
+
+
 class ModifiedResNet(nn.Module):
     """
     A ResNet class that is similar to torchvision's but contains the following changes:
@@ -118,6 +177,15 @@ class ModifiedResNet(nn.Module):
         self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
         self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
         self.layer4 = self._make_layer(width * 8, layers[3], stride=1) 
+        
+
+        # MSCSA modules after the first three residual stages (paper: after stage1/2/3)
+        # module1: fuse stem -> layer1 (stride=1)
+        self.mscsa1 = MSCSA(c_low=width, c_high=width * 4, stride=1, reduction=4)
+        # module2: fuse layer1 -> layer2 (stride=2)
+        self.mscsa2 = MSCSA(c_low=width * 4, c_high=width * 8, stride=2, reduction=4)
+        # module3: fuse layer2 -> layer3 (stride=2)
+        self.mscsa3 = MSCSA(c_low=width * 8, c_high=width * 16, stride=2, reduction=4)
         embed_dim = width * 32  # the ResNet feature dimension
         self.attnpool = AttentionPool2d(input_resolution, embed_dim, heads, output_dim)
 
@@ -137,13 +205,19 @@ class ModifiedResNet(nn.Module):
             x = self.avgpool(x)
             return x
 
-        x = x.type(self.conv1.weight.dtype) 
-        x = stem(x) 
-        x = self.layer1(x) 
-        x = self.layer2(x) 
-        x3 = self.layer3(x) 
-        x4 = self.layer4(x3) 
-        xproj = self.attnpool(x4) 
+        x = x.type(self.conv1.weight.dtype)
+        x0 = stem(x)              # low-level stem feature
+        x1 = self.layer1(x0)      # stage1 high-level
+        x1 = self.mscsa1(x0, x1)  # MSCSA after stage1
+
+        x2 = self.layer2(x1)      # stage2 high-level
+        x2 = self.mscsa2(x1, x2)  # MSCSA after stage2
+
+        x3 = self.layer3(x2)      # stage3 high-level
+        x3 = self.mscsa3(x2, x3)  # MSCSA after stage3
+
+        x4 = self.layer4(x3)      # stage4
+        xproj = self.attnpool(x4)
 
         return x3, x4, xproj 
 
@@ -442,7 +516,9 @@ def build_model(state_dict: dict, h_resolution: int, w_resolution: int, vision_s
             
     convert_weights(model)
 
-    model.load_state_dict(state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if len(missing) > 0 or len(unexpected) > 0:
+        print(f'[MSCSA] load_state_dict strict=False, missing={len(missing)}, unexpected={len(unexpected)}')
     return model.eval()
 
 import math
