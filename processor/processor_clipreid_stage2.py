@@ -133,12 +133,16 @@ def do_train_stage2(cfg,
                 if updated_text is not None:
                     t_upd = F.normalize(updated_text.float(), dim=-1)
                     pos_new = logit_scale * (v * t_upd).sum(dim=-1)  # (B,)
-                    idx = torch.arange(target.size(0), device=target.device)
-                    logits = logits.clone()
-                    logits[idx, target] = pos_new
+                    target_idx = target.long().view(-1, 1)
+                    logits = logits.scatter(1, target_idx, pos_new.view(-1, 1))
 
                 # Loss tổng: ID + Triplet + I2T (định nghĩa trong make_loss.py)
-                loss = loss_fn(score, feat_align, target, target_cam, logits)
+                out = loss_fn(score, feat_align, target, target_cam, logits)
+                if isinstance(out, (tuple, list)):
+                    loss, id_loss, tri_loss, i2t_loss = out
+                else:
+                    loss = out
+                    id_loss = tri_loss = i2t_loss = None
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
