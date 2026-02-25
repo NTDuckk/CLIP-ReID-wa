@@ -40,13 +40,13 @@ class Bottleneck(nn.Module):
     def forward(self, x: torch.Tensor):
         identity = x
 
-        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn1(self.conv1(x.to(self.conv1.weight.dtype))))
         out = self.relu(self.bn2(self.conv2(out)))
         out = self.avgpool(out)
         out = self.bn3(self.conv3(out))
 
         if self.downsample is not None:
-            identity = self.downsample(x)
+            identity = self.downsample(x.to(self.conv1.weight.dtype))
 
         out += identity
         out = self.relu(out)
@@ -117,6 +117,10 @@ class MSCSA(nn.Module):
 
     def forward(self, f_l: torch.Tensor, f_h: torch.Tensor) -> torch.Tensor:
         # f_l: (B, C_l, H_l, W_l), f_h: (B, C_h, H_h, W_h)
+        # Ensure float32 for bmm and conv to avoid misaligned address errors in fp16
+        f_l = f_l.float()
+        f_h = f_h.float()
+        
         B, _, Hh, Wh = f_h.shape
         HW = Hh * Wh
 
@@ -208,13 +212,14 @@ class ModifiedResNet(nn.Module):
         x = x.type(self.conv1.weight.dtype)
         x0 = stem(x)              # low-level stem feature
         x1 = self.layer1(x0)      # stage1 high-level
-        x1 = self.mscsa1(x0, x1)  # MSCSA after stage1
+        # MSCSA expects float32 to avoid misalignment in bmm
+        x1 = self.mscsa1(x0.float(), x1.float()).type(x1.dtype)  # MSCSA after stage1
 
         x2 = self.layer2(x1)      # stage2 high-level
-        x2 = self.mscsa2(x1, x2)  # MSCSA after stage2
+        x2 = self.mscsa2(x1.float(), x2.float()).type(x2.dtype)  # MSCSA after stage2
 
         x3 = self.layer3(x2)      # stage3 high-level
-        x3 = self.mscsa3(x2, x3)  # MSCSA after stage3
+        x3 = self.mscsa3(x2.float(), x3.float()).type(x3.dtype)  # MSCSA after stage3
 
         x4 = self.layer4(x3)      # stage4
         xproj = self.attnpool(x4)
