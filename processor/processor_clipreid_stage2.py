@@ -134,6 +134,7 @@ def do_train_stage2(cfg,
                     t_upd = F.normalize(updated_text.float(), dim=-1)
                     pos_new = logit_scale * (v * t_upd).sum(dim=-1)  # (B,)
                     target_idx = target.long().view(-1, 1)
+                    pos_new = pos_new.to(logits.dtype)
                     logits = logits.scatter(1, target_idx, pos_new.view(-1, 1))
 
                 # Loss tổng: ID + Triplet + I2T (định nghĩa trong make_loss.py)
